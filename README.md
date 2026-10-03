@@ -45,6 +45,58 @@
 `forked` 裁决使用 HTTP 409；签名不合法 403；缺口超过 32 返回 422；
 未登记的流返回 404。
 
+## 离线 Merkle 证明（只读）
+
+`GET /streams/{id}/records/{seq}/proof?watermark=N` 供离线审查方独立确认
+某条已封存记录确实属于指定历史前缀，无需下载整段记录。它**绝不开启写
+事务**，不改变水位、冻结裁决或任何已有的重传裁决。
+
+- 只对已 `sealed` 的序号、且 `1 <= N <= 当前水位` 提供证明；pending
+  记录永远无法进入证明。冻结流只能在它停住的水位取已有前缀，
+  `watermark` 越界（0、负数、超过当前水位）一律拒绝。
+- 叶节点的待哈希数据按固定二进制顺序编码，**不经过 JSON 重编码**：
+
+  ```
+  u16be(len(id)) || id 的 ASCII 字节 || u64be(seq)
+  || prev_digest[32] || payload_digest[32] || signature[64]
+  ```
+
+- 哈希带域标签，叶与内部节点不可互混：
+
+  ```
+  leaf = sha256(0x00 || leaf_pre_image)
+  node = sha256(0x01 || left || right)
+  ```
+
+  奇数层的尾节点**原样提升**（不复制、不重新哈希）；单叶树的根即叶摘要。
+- 响应自包含：完整记录字段、前缀根摘要，以及**叶到根**顺序的兄弟摘要
+  数组；每项的 `position`（`left`/`right`）标明兄弟相对被证节点的位置，
+  审查方仅凭响应即可复算根。历史水位在后续补齐记录、发生重传或服务重启
+  后给出完全相同的根与路径。
+- 错误码：流不存在 404；序号不在该前缀（含 0、含 pending）404；
+  `watermark` 为 0/负数/非整数 422；超过当前水位 404。
+
+响应示例：
+
+```json
+{
+  "id": "buoy-001",
+  "seq": 2,
+  "watermark": 3,
+  "record": {
+    "prev_digest": "…",
+    "payload_digest": "…",
+    "signature": "…"
+  },
+  "root_digest": "…",
+  "proof": [
+    {"digest": "…", "position": "right"},
+    {"digest": "…", "position": "left"}
+  ]
+}
+```
+
+
 ## 运行
 
 宿主机端口可用 `HOST_PORT` 配置（默认 8080）：
@@ -92,8 +144,9 @@ PYTHONPATH=. python -m pytest
 
 ```
 app/message.py   规定二进制消息的编码
-app/storage.py   SQLite 模式、事务化提交、封存循环、分叉冻结、重启重建
+app/merkle.py    固定二进制叶编码、域标签哈希、奇数层提升与 Merkle 路径
+app/storage.py   SQLite 模式、事务化提交、封存循环、分叉冻结、重启重建、只读证明
 app/main.py      FastAPI 路由与 Ed25519 原始消息验签
-tests/           行为测试
+tests/           行为测试（含独立复算的 Merkle 证明测试）
 scripts/         smoke.py / verify.sh / verify-all.sh
 ```

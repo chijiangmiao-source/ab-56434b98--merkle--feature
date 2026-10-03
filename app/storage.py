@@ -17,6 +17,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 
+from .merkle import encode_leaf, root_and_path
 from .message import ZERO_DIGEST
 
 SCHEMA = """
@@ -57,6 +58,24 @@ class Verdict:
     watermark: int
     tail_digest: bytes
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class ProofStep:
+    digest: bytes
+    position: str  # "left" | "right": sibling's position relative to the node
+
+
+@dataclass(frozen=True)
+class Proof:
+    stream_id: str
+    seq: int
+    watermark: int
+    prev_digest: bytes
+    payload_digest: bytes
+    signature: bytes
+    root: bytes
+    path: list[ProofStep]
 
 
 class Store:
@@ -107,6 +126,74 @@ class Store:
             return self._conn.execute(
                 "SELECT * FROM streams WHERE id = ?", (stream_id,)
             ).fetchone()
+
+    # -- read-only archive proof -----------------------------------------
+
+    def get_proof(self, stream_id: str, seq: int, watermark: int) -> Proof:
+        """Build a Merkle proof for one sealed record at a historical prefix.
+
+        Read-only: it never opens a write transaction and never touches the
+        watermark, freeze verdict or prior retransmission verdicts.
+
+        ``watermark`` must be the *historical* prefix length: 1..current
+        watermark. Pending records are never part of a proof; a forked stream
+        is served only at the watermark it froze at.
+        """
+        with self._lock:
+            conn = self._conn
+            stream = conn.execute(
+                "SELECT * FROM streams WHERE id = ?", (stream_id,)
+            ).fetchone()
+            if stream is None:
+                raise UnknownStream(stream_id)
+            current = stream["watermark"]
+            if not isinstance(watermark, int) or watermark < 1:
+                raise InvalidWatermark(
+                    stream_id, watermark, current,
+                    "watermark must be a positive integer",
+                )
+            if watermark > current:
+                raise InvalidWatermark(
+                    stream_id, watermark, current,
+                    "watermark is beyond the current sealed prefix",
+                )
+            if not 1 <= seq <= watermark:
+                raise UnsealedRecord(stream_id, seq)
+
+            rows = conn.execute(
+                "SELECT seq, prev_digest, payload_digest, signature "
+                "FROM records WHERE stream_id = ? AND seq <= ? "
+                "AND state = 'sealed' ORDER BY seq",
+                (stream_id, watermark),
+            ).fetchall()
+            # Defense in depth: the sealed prefix is always contiguous; a
+            # short row set means the requested record was never sealed and
+            # must not enter a proof.
+            if len(rows) != watermark or rows[seq - 1]["seq"] != seq:
+                raise UnsealedRecord(stream_id, seq)
+
+            leaves = [
+                encode_leaf(
+                    stream_id,
+                    row["seq"],
+                    bytes(row["prev_digest"]),
+                    bytes(row["payload_digest"]),
+                    bytes(row["signature"]),
+                )
+                for row in rows
+            ]
+            root, path = root_and_path(leaves, seq - 1)
+            target = rows[seq - 1]
+            return Proof(
+                stream_id=stream_id,
+                seq=seq,
+                watermark=watermark,
+                prev_digest=bytes(target["prev_digest"]),
+                payload_digest=bytes(target["payload_digest"]),
+                signature=bytes(target["signature"]),
+                root=root,
+                path=[ProofStep(digest=d, position=p) for d, p in path],
+            )
 
     # -- record submission ------------------------------------------------
 
@@ -332,3 +419,19 @@ class GapTooLarge(Exception):
         super().__init__(
             f"seq {seq} is more than {MAX_GAP} beyond watermark {watermark}"
         )
+
+
+class InvalidWatermark(Exception):
+    def __init__(self, stream_id: str, watermark: int, current: int,
+                 reason: str):
+        self.stream_id = stream_id
+        self.watermark = watermark
+        self.current = current
+        super().__init__(reason)
+
+
+class UnsealedRecord(Exception):
+    def __init__(self, stream_id: str, seq: int):
+        self.stream_id = stream_id
+        self.seq = seq
+        super().__init__(f"seq {seq} is not part of the sealed prefix")

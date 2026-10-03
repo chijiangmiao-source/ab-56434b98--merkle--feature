@@ -6,12 +6,15 @@ Covers, over real HTTP:
   * stream registration + public-key immutability
   * out-of-order merge (records 3,2 then 1) and identical retransmission
   * fork freeze via conflicting retransmission, and frozen permanence
+  * read-only Merkle archive proof, independently recomputed here
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
+import struct
 import sys
 
 import nacl.signing
@@ -104,6 +107,50 @@ def main() -> int:
     r = call("POST", f"/streams/{fsid}/records",
              rec(fkey, fsid, 2, digest(71), digest(72)), expect=(409,))
     assert r["watermark"] == 1 and r["status"] == "forked", r
+
+    # A third stream: Merkle proof at a *historical* watermark, recomputed
+    # independently over raw bytes (no app.merkle import).
+    pkey = nacl.signing.SigningKey.generate()
+    psid = "smoke-buoy-proof"
+    call("POST", "/streams",
+         {"id": psid, "public_key": b64(pkey.verify_key.encode())},
+         expect=(200,))
+    d = {i: digest(i + 200) for i in range(1, 6)}
+    leaf_ref = {}
+    for i in range(1, 6):
+        prev = ZERO_DIGEST if i == 1 else d[i - 1]
+        signed = rec(pkey, psid, i, prev, d[i])
+        call("POST", f"/streams/{psid}/records", signed, expect=(200,))
+        pre = (struct.pack(">H", len(psid.encode())) + psid.encode()
+               + struct.pack(">Q", i) + prev + d[i]
+               + base64.b64decode(signed["signature"]))
+        leaf_ref[i] = hashlib.sha256(b"\x00" + pre).digest()
+
+    # Ask for seq 3 as of the historical prefix of length 3.
+    p = call("GET", f"/streams/{psid}/records/3/proof?watermark=3",
+             expect=(200,))
+    assert p["watermark"] == 3 and p["seq"] == 3, p
+    node = leaf_ref[3]
+    for step in p["proof"]:  # leaf -> root, using the sibling's position
+        sib = bytes.fromhex(step["digest"])
+        node = (hashlib.sha256(b"\x01" + sib + node).digest()
+                if step["position"] == "left"
+                else hashlib.sha256(b"\x01" + node + sib).digest())
+    assert node == bytes.fromhex(p["root_digest"]), "proof mismatch"
+
+    # Error boundaries over real HTTP.
+    call("GET", f"/streams/{psid}/records/1/proof?watermark=0",
+         expect=(422,))
+    call("GET", f"/streams/{psid}/records/1/proof?watermark=99",
+         expect=(404,))
+    call("GET", f"/streams/{psid}/records/5/proof?watermark=3",
+         expect=(404,))
+    call("GET", "/streams/no-such-buoy/records/1/proof?watermark=1",
+         expect=(404,))
+    # The read-only proof changed nothing: duplicate verdict still stands.
+    r = call("POST", f"/streams/{psid}/records",
+             rec(pkey, psid, 3, d[2], d[3]), expect=(200,))
+    assert r["duplicate"] is True and r["watermark"] == 5, r
 
     if failures:
         print("SMOKE FAILURES:")

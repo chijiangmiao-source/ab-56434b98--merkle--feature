@@ -8,7 +8,7 @@ import os
 from contextlib import asynccontextmanager
 
 import nacl.signing
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -16,9 +16,11 @@ from .message import encode_message
 from .storage import (
     GapTooLarge,
     InvalidSignature,
+    InvalidWatermark,
     KeyConflict,
     Store,
     UnknownStream,
+    UnsealedRecord,
 )
 
 MAX_GAP = 32
@@ -95,6 +97,68 @@ def create_app(db_path: str) -> FastAPI:
                                   "forbidden"},
             )
         return {"id": body.id, "status": "active", "registered": outcome}
+
+    @api.get("/streams/{stream_id}/records/{seq}/proof")
+    def get_proof(
+        stream_id: str,
+        seq: int,
+        watermark: int = Query(
+            ..., ge=1, le=(1 << 64) - 1,
+            description="historical sealed prefix length to prove against",
+        ),
+    ):
+        """Read-only Merkle proof of one sealed record at a past watermark.
+
+        The response is self-contained: the record fields, the prefix root
+        digest, and the sibling path (leaf -> root) let an offline reviewer
+        re-hash the root without fetching anything else. Pending records are
+        never provable; a frozen stream is only served at the watermark it
+        stopped at. This call never mutates watermark, freeze verdict or any
+        prior retransmission verdict.
+        """
+        store = api.state.store
+        try:
+            proof = store.get_proof(stream_id, seq, watermark)
+        except UnknownStream:
+            return JSONResponse(
+                status_code=404, content={"error": "unknown stream"}
+            )
+        except InvalidWatermark as exc:
+            status = 404 if exc.watermark > exc.current else 400
+            return JSONResponse(
+                status_code=status,
+                content={"error": str(exc),
+                         "requested_watermark": exc.watermark,
+                         "current_watermark": exc.current},
+            )
+        except UnsealedRecord:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "record is not sealed within the requested "
+                                  "prefix",
+                         "seq": seq, "watermark": watermark},
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "id": proof.stream_id,
+                "seq": proof.seq,
+                "watermark": proof.watermark,
+                "record": {
+                    "prev_digest": proof.prev_digest.hex(),
+                    "payload_digest": proof.payload_digest.hex(),
+                    "signature": proof.signature.hex(),
+                },
+                "root_digest": proof.root.hex(),
+                # Sibling digests in leaf->root order. "position" says where
+                # the sibling sits relative to the proven node; the reviewer
+                # combines it on that side to rebuild the root.
+                "proof": [
+                    {"digest": step.digest.hex(), "position": step.position}
+                    for step in proof.path
+                ],
+            },
+        )
 
     @api.post("/streams/{stream_id}/records")
     def submit_record(stream_id: str, body: RecordRequest):
