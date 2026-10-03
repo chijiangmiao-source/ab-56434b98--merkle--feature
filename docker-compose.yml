@@ -1,0 +1,38 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: buoy-archive:latest
+    environment:
+      BUOY_DB: /data/buoy.db
+    ports:
+      # Configurable host port: HOST_PORT=9090 docker compose up -d
+      - "${HOST_PORT:-8080}:8000"
+    volumes:
+      - buoy-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2); assert json.load(r)['status']=='ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: buoy-archive-verify:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8000
+    entrypoint: ["bash", "scripts/verify.sh"]
+    # One-shot container: runs tests/smoke, exits with the stage's exit code.
+    restart: "no"
+
+volumes:
+  buoy-data:
