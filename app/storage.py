@@ -108,6 +108,60 @@ class Store:
                 "SELECT * FROM streams WHERE id = ?", (stream_id,)
             ).fetchone()
 
+    # -- inclusion proofs (read-only) --------------------------------------
+
+    def prefix_proof_rows(
+        self, stream_id: str, seq: int, watermark: int
+    ) -> tuple[sqlite3.Row, sqlite3.Row, list[sqlite3.Row]]:
+        """Fetch everything needed to build a Merkle inclusion proof.
+
+        Pure SELECTs under the store lock: this never mutates records,
+        watermark, or freeze verdicts, and never seals anything. Returns
+        ``(stream_row, record_row, sealed_rows)`` where ``sealed_rows`` are
+        exactly the sealed records ``1..watermark`` in seq order.
+
+        Raises ``UnknownStream``, ``WatermarkOutOfRange`` (zero/negative or
+        beyond the current -- possibly frozen -- watermark),
+        ``RecordNotSealed`` (no sealed record at ``seq``; pending and forked
+        records can never be proven) and ``SeqBeyondWatermark`` (the record
+        is sealed but not covered by the requested historical watermark).
+        """
+        with self._lock:
+            conn = self._conn
+            stream = conn.execute(
+                "SELECT * FROM streams WHERE id = ?", (stream_id,)
+            ).fetchone()
+            if stream is None:
+                raise UnknownStream(stream_id)
+            current = stream["watermark"]
+            if watermark < 1 or watermark > current:
+                raise WatermarkOutOfRange(stream_id, watermark, current)
+            record = conn.execute(
+                "SELECT * FROM records WHERE stream_id = ? AND seq = ?",
+                (stream_id, seq),
+            ).fetchone()
+            if record is None or record["state"] != "sealed":
+                raise RecordNotSealed(stream_id, seq)
+            if seq > watermark:
+                raise SeqBeyondWatermark(stream_id, seq, watermark)
+            rows = conn.execute(
+                "SELECT seq, prev_digest, payload_digest, signature "
+                "FROM records "
+                "WHERE stream_id = ? AND seq <= ? AND state = 'sealed' "
+                "ORDER BY seq",
+                (stream_id, watermark),
+            ).fetchall()
+            # Prefix invariant: the sealed records below the watermark are
+            # exactly seqs 1..watermark, so the tree has `watermark` leaves.
+            if len(rows) != watermark or any(
+                row["seq"] != i + 1 for i, row in enumerate(rows)
+            ):
+                raise RuntimeError(
+                    f"sealed prefix invariant violated for {stream_id} "
+                    f"at watermark {watermark}"
+                )
+            return stream, record, rows
+
     # -- record submission ------------------------------------------------
 
     def submit(
@@ -322,6 +376,44 @@ class KeyConflict(Exception):
 
 class InvalidSignature(Exception):
     pass
+
+
+class RecordNotSealed(Exception):
+    """No sealed record at the requested seq (pending/forked/missing)."""
+
+    def __init__(self, stream_id: str, seq: int):
+        self.stream_id = stream_id
+        self.seq = seq
+        super().__init__(
+            f"record seq={seq} of stream {stream_id!r} is not sealed; "
+            "pending or forked records can never enter a proof"
+        )
+
+
+class WatermarkOutOfRange(Exception):
+    """Zero/negative watermark or one beyond the current sealed watermark."""
+
+    def __init__(self, stream_id: str, watermark: int, current: int):
+        self.stream_id = stream_id
+        self.watermark = watermark
+        self.current = current
+        super().__init__(
+            f"watermark {watermark} out of range: stream {stream_id!r} "
+            f"has sealed watermark {current}"
+        )
+
+
+class SeqBeyondWatermark(Exception):
+    """The sealed record exists but is not covered by the requested tree."""
+
+    def __init__(self, stream_id: str, seq: int, watermark: int):
+        self.stream_id = stream_id
+        self.seq = seq
+        self.watermark = watermark
+        super().__init__(
+            f"seq {seq} lies beyond requested watermark {watermark} "
+            f"for stream {stream_id!r}"
+        )
 
 
 class GapTooLarge(Exception):

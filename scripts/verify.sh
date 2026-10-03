@@ -8,7 +8,7 @@ export PYTHONPATH=/app
 echo "== [1/3] image build sanity: app importable in built image =="
 python -c "import app.main; print('app.main imports OK')"
 
-echo "== [2/3] code tests (out-of-order merge, fork freeze, restart) =="
+echo "== [2/3] code tests (out-of-order merge, fork freeze, restart, merkle proofs) =="
 python -m pytest -v
 
 echo "== [3/3] live HTTP smoke against http://app:8000 =="

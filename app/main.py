@@ -8,17 +8,21 @@ import os
 from contextlib import asynccontextmanager
 
 import nacl.signing
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import merkle
 from .message import encode_message
 from .storage import (
     GapTooLarge,
     InvalidSignature,
     KeyConflict,
+    RecordNotSealed,
+    SeqBeyondWatermark,
     Store,
     UnknownStream,
+    WatermarkOutOfRange,
 )
 
 MAX_GAP = 32
@@ -149,6 +153,94 @@ def create_app(db_path: str) -> FastAPI:
                 "duplicate": verdict.duplicate,
             },
         )
+
+    @api.get("/streams/{stream_id}/records/{seq}/proof")
+    def get_proof(
+        stream_id: str,
+        seq: int = Path(ge=1, le=(1 << 64) - 1),
+        watermark: int = Query(...),
+    ):
+        """Merkle inclusion proof for a sealed record at a past watermark.
+
+        Read-only: never advances the watermark, never freezes, never
+        changes retransmission verdicts. The tree covers exactly the sealed
+        records 1..watermark; pending/forked records can never appear.
+        """
+        store = api.state.store
+        try:
+            stream, record, rows = store.prefix_proof_rows(
+                stream_id, seq, watermark
+            )
+        except UnknownStream:
+            return JSONResponse(
+                status_code=404, content={"error": "unknown stream"}
+            )
+        except WatermarkOutOfRange as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": str(exc),
+                    "watermark": exc.watermark,
+                    "current_watermark": exc.current,
+                },
+            )
+        except RecordNotSealed as exc:
+            return JSONResponse(
+                status_code=404, content={"error": str(exc)}
+            )
+        except SeqBeyondWatermark as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": str(exc),
+                    "seq": exc.seq,
+                    "watermark": exc.watermark,
+                },
+            )
+
+        leaves = [
+            merkle.leaf_digest(
+                stream_id,
+                row["seq"],
+                bytes(row["prev_digest"]),
+                bytes(row["payload_digest"]),
+                bytes(row["signature"]),
+            )
+            for row in rows
+        ]
+        root = merkle.merkle_root(leaves)
+        steps = merkle.merkle_path(leaves, seq - 1)
+        return {
+            "id": stream_id,
+            "seq": seq,
+            "state": "sealed",
+            "status": stream["status"],
+            # The watermark the proof was taken at == the tree's leaf count.
+            "watermark": watermark,
+            "current_watermark": stream["watermark"],
+            "record": {
+                "seq": seq,
+                "prev_digest": base64.b64encode(
+                    bytes(record["prev_digest"])
+                ).decode(),
+                "payload_digest": base64.b64encode(
+                    bytes(record["payload_digest"])
+                ).decode(),
+                "signature": base64.b64encode(
+                    bytes(record["signature"])
+                ).decode(),
+            },
+            "leaf_index": seq - 1,
+            "leaf_count": watermark,
+            "leaf_digest": leaves[seq - 1].hex(),
+            "root_digest": root.hex(),
+            # Siblings ordered leaf-to-root; `position` is the side the
+            # sibling sits on relative to the running node.
+            "path": [
+                {"digest": step.digest.hex(), "position": step.position}
+                for step in steps
+            ],
+        }
 
     return api
 
